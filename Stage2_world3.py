@@ -24,7 +24,7 @@ DF_TABLES_FULL = {
     "PERSISTENT_POLLUTION":         r"C:\Users\ASUS\Desktop\world3_stage1_full_v5\persistent_pollution_full_df.csv",
 }
 
-OUT_DIR  = r"C:\Users\ASUS\Desktop\world3_stage1_full_v5\world3_stage2_out_std"
+OUT_DIR  = r"C:\Users\ASUS\Desktop\world3_stage1_full_v5\world3_stage2_out_1102"
 FEATURES = [
     "desired_completed_family_size_normal",
     "lifetime_perception_delay",
@@ -218,23 +218,37 @@ def format_constraints_compact(bounds: dict, max_items: int = 14) -> str:
         hi     = bd.get("high",  np.inf)
         lo_inc = bd.get("low_inc",  False)
         hi_inc = bd.get("high_inc", False)
+
+        infeasible = False
         if np.isfinite(lo) and np.isfinite(hi):
-            left  = "≤" if lo_inc else "<"
-            right = "≤" if hi_inc else "<"
-            s = f"{lo:.6g} {left} {name} {right} {hi:.6g}"
-        elif np.isfinite(hi):
-            sym = "≤" if hi_inc else "<"
-            s = f"{name} {sym} {hi:.6g}"
-        elif np.isfinite(lo):
-            sym = "≥" if lo_inc else ">"
-            s = f"{name} {sym} {lo:.6g}"
+            if lo > hi:
+                infeasible = True
+            if lo == hi and (not lo_inc or not hi_inc):
+                # (lo,hi) gibi açık uç -> boş küme
+                infeasible = True
+
+        if infeasible:
+            s = f"⚠ {name}: INFEASIBLE (lo={lo:.6g}{'≤' if lo_inc else '<'} , hi={'≤' if hi_inc else '<'}{hi:.6g})"
         else:
-            s = f"{name}: (no bounds)"
+            if np.isfinite(lo) and np.isfinite(hi):
+                left  = "≤" if lo_inc else "<"
+                right = "≤" if hi_inc else "<"
+                s = f"{lo:.6g} {left} {name} {right} {hi:.6g}"
+            elif np.isfinite(hi):
+                sym = "≤" if hi_inc else "<"
+                s = f"{name} {sym} {hi:.6g}"
+            elif np.isfinite(lo):
+                sym = "≥" if lo_inc else ">"
+                s = f"{name} {sym} {lo:.6g}"
+            else:
+                s = f"{name}: (no bounds)"
         items.append(s)
+
     items.sort()
     if len(items) > max_items:
         items = items[:max_items] + ["…"]
     return "\n".join("• " + it for it in items)
+
 
 # --------------- Output helpers --------------------
 def print_and_save_splits(tree, X_cols, out_dir, save=True):
@@ -483,80 +497,124 @@ def plot_per_leaf_series_3x1_world3(
         plt.close(fig)
         print(f"[saved] {fpath}")
 
-def plot_pcp_stage1_raw(
-    X_df,
-    leaf_ids,
-    cluster_names,
-    out_dir,
-    fname="pcp_stage1_raw.png",
-    alpha=0.35,
-    lw=1.2,
-    figsize=(11, 8),
+def plot_pcp_cluster_envelopes_raw(
+    X_df: pd.DataFrame,
+    leaf_ids: np.ndarray,
+    cluster_names: dict,
+    out_dir: str,
+    fname: str = "pcp_cluster_envelopes_raw.png",
+    figsize=(12, 7),
+    lw_minmax: float = 2.6,
+    lw_median: float = 2.2,
+    alpha_minmax: float = 0.95,
+    alpha_median: float = 0.9,
+    show_median: bool = True,
+    show_iqr_band: bool = False,   # istersen Q1-Q3 band
+    pad_frac: float = 0.06,
+    max_clusters: int | None = None,   # None = hepsi, yoksa en büyük K cluster
 ):
     """
-    TRUE Parallel Coordinates Plot
-    - Stage-1 World3 levers (RAW values)
-    - Each feature has its own vertical number line
-    - Clusters (C1, C2, ...) shown with different colors
-    - Legend placed at the bottom (outside the plot)
-    """
+    Cluster-envelope Parallel Coordinates (RAW-scale axes, geometry normalized per feature)
 
+    Her cluster için:
+      - min çizgisi (feature bazında)
+      - max çizgisi
+      - opsiyonel median çizgisi
+      - (opsiyonel) IQR band (Q1-Q3)
+
+    NOT:
+      - Eksen geometrisi için [0,1] normalizasyon yapılır (feature bazında).
+      - Tick etiketleri RAW değerlerdir.
+    """
     os.makedirs(out_dir, exist_ok=True)
 
     cols = X_df.columns.tolist()
-    X = X_df.to_numpy(dtype=float)
+    X = X_df[cols].to_numpy(dtype=float)
+    xs = np.arange(len(cols))
 
-    # --- normalize ONLY for plotting geometry (values shown are RAW) ---
-    x_min = X_df.min()
-    x_max = X_df.max()
-    span = x_max - x_min
-    span[span == 0] = 1.0
-    Xn = (X_df - x_min) / span
-    Xn = Xn.to_numpy()
+    # --- global RAW min/max for axis scaling + ticks ---
+    x_min = X_df[cols].min(axis=0).astype(float)
+    x_max = X_df[cols].max(axis=0).astype(float)
+    span = (x_max - x_min).replace(0, np.nan)
 
-    # --- cluster labels ---
+    # pad
+    for c in cols:
+        mn, mx = float(x_min[c]), float(x_max[c])
+        if not np.isfinite(mx - mn) or mx == mn:
+            dv = 1.0 if mn == 0 else abs(mn) * 0.1
+            mn -= dv; mx += dv
+        p = (mx - mn) * pad_frac
+        x_min[c] = mn - p
+        x_max[c] = mx + p
+
+    def norm_val(col, v):
+        mn = float(x_min[col]); mx = float(x_max[col])
+        sp = mx - mn if mx > mn else 1.0
+        return (v - mn) / sp
+
+    # --- labels (leaf -> Ck) ---
     labels = np.array([cluster_names.get(int(l), f"C{int(l)}") for l in leaf_ids])
     uniq = np.unique(labels)
 
+    # --- cluster sizes: büyükten küçüğe sırala ---
+    sizes = {cl: int(np.sum(labels == cl)) for cl in uniq}
+    uniq_sorted = sorted(uniq, key=lambda cl: -sizes[cl])
+    if max_clusters is not None:
+        uniq_sorted = uniq_sorted[:int(max_clusters)]
+
     # --- colors ---
     cmap = plt.cm.tab10
-    color_map = {cl: cmap(i % 10) for i, cl in enumerate(uniq)}
+    color_map = {cl: cmap(i % 10) for i, cl in enumerate(uniq_sorted)}
 
     fig, ax = plt.subplots(figsize=figsize)
-    xs = np.arange(len(cols))
-
-    # --- draw sample lines ---
-    for i in range(Xn.shape[0]):
-        ax.plot(
-            xs,
-            Xn[i],
-            color=color_map[labels[i]],
-            alpha=alpha,
-            linewidth=lw,
-            zorder=1,
-        )
 
     # --- draw vertical axes + RAW ticks ---
     for i, col in enumerate(cols):
-        ymin, ymax = float(x_min[col]), float(x_max[col])
-
         # main vertical axis
         ax.axvline(i, color="black", linewidth=1.6, zorder=3)
 
+        ymin, ymax = float(x_min[col]), float(x_max[col])
         ticks = np.linspace(ymin, ymax, 6)
         for t in ticks:
-            y = (t - ymin) / (ymax - ymin)
+            y = norm_val(col, t)
             ax.plot([i - 0.04, i], [y, y], color="black", linewidth=1.0, zorder=4)
-            ax.text(
-                i - 0.06,
-                y,
-                f"{t:.3g}",
-                ha="right",
-                va="center",
-                fontsize=9,
-            )
+            ax.text(i - 0.06, y, f"{t:.3g}", ha="right", va="center", fontsize=9)
 
-    # --- feature labels (small, multiline) ---
+    # --- plot envelopes per cluster ---
+    for cl in uniq_sorted:
+        idxs = np.where(labels == cl)[0]
+        Xc = X[idxs, :]  # RAW
+
+        # per-feature stats (RAW)
+        vmin = np.nanmin(Xc, axis=0)
+        vmax = np.nanmax(Xc, axis=0)
+        vmed = np.nanmedian(Xc, axis=0)
+        q1 = np.nanquantile(Xc, 0.25, axis=0)
+        q3 = np.nanquantile(Xc, 0.75, axis=0)
+
+        # normalize for geometry
+        ymin_line = np.array([norm_val(cols[j], vmin[j]) for j in range(len(cols))])
+        ymax_line = np.array([norm_val(cols[j], vmax[j]) for j in range(len(cols))])
+        ymed_line = np.array([norm_val(cols[j], vmed[j]) for j in range(len(cols))])
+        yq1 = np.array([norm_val(cols[j], q1[j]) for j in range(len(cols))])
+        yq3 = np.array([norm_val(cols[j], q3[j]) for j in range(len(cols))])
+
+        colr = color_map[cl]
+
+        # min/max lines
+        ax.plot(xs, ymin_line, color=colr, linewidth=lw_minmax, alpha=alpha_minmax, zorder=2)
+        ax.plot(xs, ymax_line, color=colr, linewidth=lw_minmax, alpha=alpha_minmax, zorder=2)
+
+        # optional iqr band
+        if show_iqr_band:
+            ax.fill_between(xs, yq1, yq3, color=colr, alpha=0.12, zorder=1)
+
+        # median
+        if show_median:
+            ax.plot(xs, ymed_line, color=colr, linewidth=lw_median, alpha=alpha_median,
+                    linestyle="--", zorder=3)
+
+    # --- x labels ---
     pretty_cols = [c.replace("_", "\n") for c in cols]
     ax.set_xticks(xs)
     ax.set_xticklabels(pretty_cols, fontsize=9)
@@ -565,33 +623,27 @@ def plot_pcp_stage1_raw(
     ax.set_xlim(-0.4, len(cols) - 0.6)
     ax.set_ylim(-0.05, 1.05)
     ax.get_yaxis().set_visible(False)
-
     for spine in ax.spines.values():
         spine.set_visible(False)
 
     # --- title ---
-    ax.set_title(
-        "Parallel Coordinates Plot — World3 Stage-1 Levers (RAW)",
-        fontsize=14,
-        fontweight="bold",
-        pad=30,
-    )
+    title = "Parallel Coordinates — Cluster envelopes (min/max) + median (RAW-scale axes)"
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=22)
 
-    # --- legend (BOTTOM, outside) ---
+    # --- legend (bottom) ---
     legend_elements = [
-        Line2D([0], [0], color=color_map[cl], lw=3, label=cl)
-        for cl in uniq
+        Line2D([0], [0], color=color_map[cl], lw=3,
+               label=f"{cl} (n={sizes[cl]})")
+        for cl in uniq_sorted
     ]
-
     leg = ax.legend(
         handles=legend_elements,
         loc="upper center",
-        bbox_to_anchor=(0.5, -0.22),
-        ncol=len(uniq),
+        bbox_to_anchor=(0.5, -0.20),
+        ncol=min(len(uniq_sorted), 6),
         frameon=True,
         fontsize=10,
     )
-
     leg.get_frame().set_facecolor("white")
     leg.get_frame().set_alpha(0.95)
     leg.get_frame().set_edgecolor("black")
@@ -600,8 +652,8 @@ def plot_pcp_stage1_raw(
     path = os.path.join(out_dir, fname)
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close()
-
     print(f"[saved] {path}")
+
 
 # -------- Numberline / Feature distribution ----------
 def plot_numberlines_from_df(
@@ -1048,17 +1100,44 @@ def main():
         )
 
     # 4) Ağaç ve kurallar
+
     tree = TreeForecast(
-        target_type='multi', max_features=None, max_target=1, max_depth=15,
-        min_samples_leaf=5, min_samples_split=10, split_style='custom',
+        target_type='multi', max_features=None, max_target=1, max_depth=5,
+        min_samples_leaf=20, min_samples_split=50, split_style='custom',
         target_diff=False, lambda_decay=0.5, obj_weights = np.array([1.0, 0.1, 0.1]),
         verbose=False
     )
-    print("[info] Ağaç eğitiliyor (DTW ile)...")
+    print("[debug] X shape:", X.shape)
+    print("[debug] X dtypes:\n", X.dtypes)
+    print("[debug] X NaNs:\n", X.isna().sum())
+    print("[debug] X nunique:\n", X.nunique(dropna=False))
+
+    print("[debug] fitting tree...")
     tree.fit(X, dist_df)
 
+    # root terminal mı?
+    print("[debug] root is_terminal:", getattr(tree.Tree, "is_terminal", None))
+
+    # kaç split var?
+    try:
+        spl = tree.splits(tree.Tree, [])
+        print("[debug] n_splits:", len(spl))
+        if len(spl) > 0:
+            print("[debug] first split:", spl[0])
+    except Exception as e:
+        print("[debug] splits() failed:", e)
+
+    # leaf sayısı kaç?
+    leaf_ids_dbg = np.asarray(tree.apply(X, depth=tree.max_depth)).astype(int).reshape(-1)
+    u, c = np.unique(leaf_ids_dbg, return_counts=True)
+    print("[debug] unique leaf count:", len(u))
+    print("[debug] leaf sizes:", list(zip(u.tolist(), c.tolist()))[:30])
+
+    print("[info] Ağaç eğitiliyor (DTW ile)...")
+
     print_and_save_splits(tree, list(X.columns), OUT_DIR, save=SAVE_SPLITS_CSV)
-    rules_df, leaf_ids = per_sample_rules(tree, X, OUT_DIR, max_depth=10, save=SAVE_PER_SAMPLE_RULES_CSV)
+    DEPTH_FOR_LEAF = tree.max_depth  # veya 15
+    rules_df, leaf_ids = per_sample_rules(tree, X, OUT_DIR, max_depth=DEPTH_FOR_LEAF, save=SAVE_PER_SAMPLE_RULES_CSV)
 
     # Cluster adları
     cluster_names = make_cluster_names(leaf_ids)
@@ -1080,12 +1159,15 @@ def main():
     # indexleri leaf_ids ile hizala
     df_stage1.index = X.index
 
-    plot_pcp_stage1_raw(
+    plot_pcp_cluster_envelopes_raw(
         X_df=df_stage1,
         leaf_ids=leaf_ids,
         cluster_names=cluster_names,
         out_dir=OUT_DIR,
-        fname="pcp_stage1_raw.png"
+        fname="pcp_cluster_envelopes_raw.png",
+        show_median=True,
+        show_iqr_band=False,
+        max_clusters=10
     )
 
     # 5) 3×1 grafikler: WORLD3 FULL seriler (real ve z-score)
