@@ -444,7 +444,7 @@ class TreeForecast:
         if node.depth == depth:
             return node.id
 
-        if features[node.column] > node.threshold:
+        if features.iloc[node.column] > node.threshold:
             predicted = self.applySample(features, depth, node.right)
         else:
             predicted = self.applySample(features, depth, node.left)
@@ -918,3 +918,4 @@ if __name__ == '__main__':
                                 plt.plot(range(len(row.drop(drop_cols))), y_test_df.iloc[idx][range(0,201)], linewidth=3.0)
                                 plt.title(f'Test Instance: {instance_id}, Leaf ID: {leaf_id}, Instances Count: {leaf_count}')
                                 plt.savefig(save_path)
+
